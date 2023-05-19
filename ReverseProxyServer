@@ -1,0 +1,160 @@
+package client;
+
+import io.netty.bootstrap.Bootstrap;
+import io.netty.bootstrap.ServerBootstrap;
+import io.netty.channel.*;
+import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.socket.SocketChannel;
+import io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.channel.socket.nio.NioSocketChannel;
+import io.netty.handler.codec.http.DefaultHttpRequest;
+import io.netty.handler.codec.http.HttpClientCodec;
+import io.netty.handler.codec.http.HttpObjectAggregator;
+import io.netty.handler.codec.http.HttpResponse;
+import io.netty.handler.codec.http.HttpServerCodec;
+import io.netty.handler.logging.LogLevel;
+import io.netty.handler.logging.LoggingHandler;
+import io.netty.handler.ssl.SslContext;
+import io.netty.handler.ssl.SslContextBuilder;
+import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
+import io.netty.handler.stream.ChunkedWriteHandler;
+
+import javax.net.ssl.SSLException;
+import java.net.InetSocketAddress;
+
+public class ReverseProxyServer {
+    private final String remoteHost;
+    private final int remotePort;
+    private final int localPort;
+
+    public ReverseProxyServer(String remoteHost, int remotePort, int localPort) {
+        this.remoteHost = remoteHost;
+        this.remotePort = remotePort;
+        this.localPort = localPort;
+    }
+
+    public void start() throws InterruptedException, SSLException {
+        EventLoopGroup workerGroup = new NioEventLoopGroup();
+
+        // 创建 SSL 上下文以支持 HTTPS
+        SslContext sslContext = SslContextBuilder.forClient()
+                .trustManager(InsecureTrustManagerFactory.INSTANCE)
+                .build();
+
+
+
+        try {
+            Bootstrap bootstrap = new Bootstrap();
+            bootstrap.group(workerGroup)
+                    .channel(NioSocketChannel.class)
+                    .handler(new ChannelInitializer<SocketChannel>() {
+                        @Override
+                        protected void initChannel(SocketChannel ch) throws SSLException {
+
+                            ChannelPipeline pipeline = ch.pipeline();
+
+//                            SslContext sslContext = SslContextBuilder.forClient().protocols("TLSv1.2").build();
+//                            pipeline.addLast(sslContext.newHandler(ch.alloc()));
+
+                            pipeline.addLast(sslContext.newHandler(ch.alloc(), remoteHost, remotePort));
+                            pipeline.addLast(new HttpClientCodec());
+                            pipeline.addLast(new HttpObjectAggregator(65536));
+                            pipeline.addLast(new ChunkedWriteHandler());
+                            pipeline.addLast(new ReverseProxyHandler(remoteHost, remotePort));
+                        }
+                    });
+
+            bootstrap.connect(remoteHost, remotePort).sync();
+            System.out.println("Connected to remote server: " + remoteHost + ":" + remotePort);
+
+            ServerBootstrap serverBootstrap = new ServerBootstrap();
+            serverBootstrap.group(workerGroup)
+                    .channel(NioServerSocketChannel.class)
+                    .handler(new LoggingHandler(LogLevel.INFO))
+                    .childHandler(new ChannelInitializer<SocketChannel>() {
+                        @Override
+                        protected void initChannel(SocketChannel ch) {
+                            ChannelPipeline pipeline = ch.pipeline();
+                            pipeline.addLast(sslContext.newHandler(ch.alloc()));
+                            pipeline.addLast(new HttpServerCodec());
+                            pipeline.addLast(new HttpObjectAggregator(65536));
+                            pipeline.addLast(new ChunkedWriteHandler());
+                            pipeline.addLast(new ReverseProxyHandler(remoteHost, remotePort));
+                        }
+                    });
+
+            Channel serverChannel = serverBootstrap.bind(new InetSocketAddress(localPort)).sync().channel();
+            System.out.println("Reverse proxy server started on localhost:" + localPort);
+
+            serverChannel.closeFuture().sync();
+        } finally {
+            workerGroup.shutdownGracefully();
+        }
+    }
+
+
+    public static void main(String[] args) throws InterruptedException, SSLException {
+        ReverseProxyServer proxyServer = new ReverseProxyServer("www.mashibing.com", 443, 8888);
+        proxyServer.start();
+    }
+
+    private static class ReverseProxyHandler extends SimpleChannelInboundHandler<DefaultHttpRequest> {
+        private final String remoteHost;
+        private final int remotePort;
+
+        public ReverseProxyHandler(String remoteHost, int remotePort) {
+            this.remoteHost = remoteHost;
+            this.remotePort = remotePort;
+        }
+
+        @Override
+        protected void channelRead0(ChannelHandlerContext ctx, DefaultHttpRequest request) {
+            Bootstrap bootstrap = new Bootstrap();
+            bootstrap.group(ctx.channel().eventLoop())
+                    .channel(NioSocketChannel.class)
+                    .handler(new ChannelInitializer<SocketChannel>() {
+                        @Override
+                        protected void initChannel(SocketChannel ch) {
+                            ChannelPipeline pipeline = ch.pipeline();
+                            pipeline.addLast(new HttpClientCodec());
+                            pipeline.addLast(new HttpObjectAggregator(65536));
+                            pipeline.addLast(new ChunkedWriteHandler());
+                            pipeline.addLast(new ChannelDuplexHandler() {
+                                @Override
+                                public void channelRead(ChannelHandlerContext ctx, Object msg) {
+                                    ctx.channel().writeAndFlush(msg);
+                                }
+
+                                @Override
+                                public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) {
+                                    if (msg instanceof HttpResponse) {
+                                        HttpResponse response = (HttpResponse) msg;
+                                        // Modify the response as needed before forwarding it
+                                        // For example, you can modify headers, content, etc.
+                                        System.out.println("Received response: " + response);
+                                    }
+                                    ctx.write(msg, promise);
+                                }
+                            });
+                        }
+                    });
+
+            bootstrap.connect(remoteHost, remotePort).addListener(future -> {
+                if (future.isSuccess()) {
+                    Channel remoteChannel = ((ChannelFuture) future).channel();
+                    remoteChannel.writeAndFlush(request);
+                    ctx.channel().read();
+                } else {
+                    ctx.channel().close();
+                }
+            });
+        }
+
+        @Override
+        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+            cause.printStackTrace();
+            ctx.channel().close();
+        }
+    }
+}
+
